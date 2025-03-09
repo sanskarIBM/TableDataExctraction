@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import argparse
+import time
 from typing import List, Dict, Any, Tuple, Optional
 
 # For PDF processing
@@ -18,9 +19,6 @@ from docx.table import Table as DocxTable
 # For table detection and extraction
 import pandas as pd
 from dotenv import load_dotenv
-from tabula import read_pdf
-import camelot
-import mammoth
 import groq
 
 logging.basicConfig(
@@ -29,10 +27,11 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
-import os
+
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-client = groq.Client(api_key=GROQ_API_KEY)
+client = groq.Client(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
 
 class DocumentAgent:
     """Agent responsible for identifying tables in documents."""
@@ -57,85 +56,170 @@ class DocumentAgent:
         """Identify tables in PDF documents using multiple methods."""
         logger.info(f"Identifying tables in PDF: {self.file_path}")
 
-        # Method 1: Use tabula-py for initial detection
         tables_tabula = []
-        try:
-            dfs = read_pdf(self.file_path, pages='all', multiple_tables=True)
-            for i, df in enumerate(dfs):
-                if not df.empty:
-                    tables_tabula.append({
-                        'method': 'tabula',
-                        'page': i + 1,  # Approximate page number
-                        'data': df
-                    })
-        except Exception as e:
-            logger.warning(f"Tabula extraction error: {e}")
-
-        # Method 2: Use camelot for more accurate detection
         tables_camelot = []
-        try:
-            tables = camelot.read_pdf(self.file_path, pages='all', flavor='lattice')
-            tables.extend(camelot.read_pdf(self.file_path, pages='all', flavor='stream'))
-
-            for i, table in enumerate(tables):
-                if table.df.empty:
-                    continue
-                tables_camelot.append({
-                    'method': 'camelot',
-                    'page': table.page,
-                    'accuracy': table.accuracy,
-                    'data': table.df
-                })
-        except Exception as e:
-            logger.warning(f"Camelot extraction error: {e}")
-
-        # Method 3: Visual detection using OpenCV
         tables_visual = []
+
+        # Method 1: Try tabula-py with safer error handling
+        try:
+            # Dynamically import tabula to avoid initial import errors
+            from tabula import read_pdf
+
+            # Use explicit encoding parameter and handle potential errors
+            try:
+                dfs_default = read_pdf(self.file_path, pages='all', multiple_tables=True, encoding='latin1')
+                dfs_lattice = read_pdf(self.file_path, pages='all', multiple_tables=True, lattice=True,
+                                       encoding='latin1')
+                dfs_stream = read_pdf(self.file_path, pages='all', multiple_tables=True, stream=True, encoding='latin1')
+
+                # Combine all results
+                dfs = dfs_default + dfs_lattice + dfs_stream
+
+                for i, df in enumerate(dfs):
+                    if not df.empty and len(df.columns) > 1:
+                        tables_tabula.append({
+                            'method': 'tabula',
+                            'page': i % 10 + 1,  # Rough estimation
+                            'data': df
+                        })
+            except Exception as e:
+                logger.warning(f"Tabula extraction error with encoding 'latin1': {e}")
+                # Try with a different encoding
+                try:
+                    dfs = read_pdf(self.file_path, pages='all', multiple_tables=True, encoding='utf-8')
+                    for i, df in enumerate(dfs):
+                        if not df.empty and len(df.columns) > 1:
+                            tables_tabula.append({
+                                'method': 'tabula',
+                                'page': i % 10 + 1,
+                                'data': df
+                            })
+                except Exception as e2:
+                    logger.warning(f"Tabula extraction error with encoding 'utf-8': {e2}")
+        except ImportError:
+            logger.warning("Tabula not available, skipping this method")
+
+        # Method 2: Use camelot with safer error handling
+        try:
+            import camelot
+            try:
+                tables = []
+                try:
+                    tables.extend(camelot.read_pdf(self.file_path, pages='all', flavor='lattice'))
+                except Exception as e:
+                    logger.warning(f"Camelot lattice flavor error: {e}")
+
+                try:
+                    tables.extend(camelot.read_pdf(self.file_path, pages='all', flavor='stream', edge_tol=500))
+                except Exception as e:
+                    logger.warning(f"Camelot stream flavor error: {e}")
+
+                for i, table in enumerate(tables):
+                    if not table.df.empty:
+                        tables_camelot.append({
+                            'method': 'camelot',
+                            'page': table.page,
+                            'accuracy': table.accuracy,
+                            'data': table.df
+                        })
+            except Exception as e:
+                logger.warning(f"Camelot extraction error: {e}")
+        except ImportError:
+            logger.warning("Camelot not available, skipping this method")
+
+        # Method 3: Visual detection with improved error handling
         try:
             doc = fitz.open(self.file_path)
             for page_num, page in enumerate(doc):
-                pix = page.get_pixmap()
-                img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                try:
+                    pix = page.get_pixmap(alpha=False)
+                    img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
 
-                # Convert to grayscale if it's RGB
-                if pix.n >= 3:
-                    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-                else:
-                    gray = img_array
+                    # Convert to grayscale if needed
+                    if pix.n >= 3:
+                        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+                    else:
+                        gray = img_array
 
-                # Apply image processing to detect tables
-                thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 3)
+                    # Apply binary threshold
+                    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-                # Find contours
-                contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                    # Detect horizontal and vertical lines
+                    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
+                    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
 
-                # Filter contours that might represent tables
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > 10000:  # Minimum area threshold for a table
-                        x, y, w, h = cv2.boundingRect(contour)
+                    horizontal_lines = cv2.erode(binary, horizontal_kernel, iterations=1)
+                    horizontal_lines = cv2.dilate(horizontal_lines, horizontal_kernel, iterations=3)
 
-                        # Check if it has a table-like aspect ratio
-                        if 0.5 < w / h < 5:
-                            tables_visual.append({
-                                'method': 'visual',
-                                'page': page_num + 1,
-                                'bbox': (x, y, x + w, y + h),
-                                'raw_image': img_array[y:y + h, x:x + w]
-                            })
+                    vertical_lines = cv2.erode(binary, vertical_kernel, iterations=1)
+                    vertical_lines = cv2.dilate(vertical_lines, vertical_kernel, iterations=3)
+
+                    # Combine lines
+                    table_mask = cv2.bitwise_or(horizontal_lines, vertical_lines)
+
+                    # Find contours
+                    contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    # Filter potential tables
+                    for contour in contours:
+                        area = cv2.contourArea(contour)
+                        if area > 5000:
+                            x, y, w, h = cv2.boundingRect(contour)
+                            if 0.2 < w / h < 10 and w > 100 and h > 100:
+                                tables_visual.append({
+                                    'method': 'visual',
+                                    'page': page_num + 1,
+                                    'bbox': (x, y, x + w, y + h),
+                                    'raw_image': img_array[y:y + h, x:x + w].copy()  # Ensure a copy
+                                })
+                except Exception as e:
+                    logger.warning(f"Error processing page {page_num + 1}: {e}")
             doc.close()
         except Exception as e:
             logger.warning(f"Visual detection error: {e}")
 
-        # Combine and deduplicate results
-        all_tables = []
-        all_tables.extend(tables_tabula)
-        all_tables.extend(tables_camelot)
-        all_tables.extend(tables_visual)
+        # Fallback: Extract page text directly if no tables detected
+        all_tables = tables_tabula + tables_camelot + tables_visual
+
+        if not all_tables:
+            logger.info("No tables detected with standard methods, trying text extraction")
+            try:
+                doc = fitz.open(self.file_path)
+                for page_num, page in enumerate(doc):
+                    text = page.get_text()
+                    if text.strip():
+                        # Create structured data from text
+                        text_lines = [line.strip() for line in text.split('\n') if line.strip()]
+                        if len(text_lines) > 5:  # Minimum number of lines for potential table
+                            all_tables.append({
+                                'method': 'text',
+                                'page': page_num + 1,
+                                'text_content': text_lines
+                            })
+                doc.close()
+            except Exception as e:
+                logger.warning(f"Text extraction error: {e}")
+
+            # If still no tables, use full-page images as last resort
+            if not all_tables:
+                logger.info("No text-based tables found, using full-page images")
+                try:
+                    doc = fitz.open(self.file_path)
+                    for page_num, page in enumerate(doc):
+                        pix = page.get_pixmap(alpha=False)
+                        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+
+                        all_tables.append({
+                            'method': 'fullpage',
+                            'page': page_num + 1,
+                            'raw_image': img_array.copy()  # Ensure a copy
+                        })
+                    doc.close()
+                except Exception as e:
+                    logger.warning(f"Full-page extraction error: {e}")
 
         # Sort by page number
         all_tables.sort(key=lambda x: x.get('page', 0))
-
         return all_tables
 
     def _process_docx(self) -> List[Dict[str, Any]]:
@@ -154,17 +238,21 @@ class DocumentAgent:
                     'table_obj': table
                 })
 
-            # Alternative approach using mammoth
-            result = mammoth.convert_to_html(self.file_path)
-            html = result.value
+            # Try mammoth if no tables found
+            if len(tables) == 0:
+                try:
+                    import mammoth
+                    result = mammoth.convert_to_html(self.file_path)
+                    html = result.value
 
-            # If tables were missed by the docx approach, we'll have them in HTML
-            if len(tables) == 0 and "<table" in html:
-                logger.info("Found tables using mammoth HTML conversion")
-                tables.append({
-                    'method': 'mammoth',
-                    'html': html
-                })
+                    if "<table" in html:
+                        logger.info("Found tables using mammoth HTML conversion")
+                        tables.append({
+                            'method': 'mammoth',
+                            'html': html
+                        })
+                except ImportError:
+                    logger.warning("Mammoth not available, skipping HTML conversion")
 
         except Exception as e:
             logger.warning(f"DOCX processing error: {e}")
@@ -177,28 +265,39 @@ class DocumentAgent:
 
         tables = []
         try:
-            # Read the image
             img = cv2.imread(self.file_path)
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # Apply threshold to get binary image
+            # Apply adaptive threshold
             thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 3)
 
-            # Find contours
-            contours, hierarchy = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            # Line detection kernels
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
 
-            # Filter contours that might represent tables
+            # Detect lines
+            horizontal_lines = cv2.erode(thresh, horizontal_kernel, iterations=1)
+            horizontal_lines = cv2.dilate(horizontal_lines, horizontal_kernel, iterations=3)
+
+            vertical_lines = cv2.erode(thresh, vertical_kernel, iterations=1)
+            vertical_lines = cv2.dilate(vertical_lines, vertical_kernel, iterations=3)
+
+            # Combine lines
+            table_mask = cv2.bitwise_or(horizontal_lines, vertical_lines)
+
+            # Find contours
+            contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            # Filter potential tables
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > 5000:  # Minimum area threshold for a table
+                if area > 5000:
                     x, y, w, h = cv2.boundingRect(contour)
-
-                    # Check if it has a table-like aspect ratio
                     if 0.5 < w / h < 5:
                         tables.append({
                             'method': 'image',
                             'bbox': (x, y, x + w, y + h),
-                            'raw_image': img[y:y + h, x:x + w]
+                            'raw_image': img[y:y + h, x:x + w].copy()  # Ensure a copy
                         })
         except Exception as e:
             logger.warning(f"Image processing error: {e}")
@@ -222,31 +321,35 @@ class ExtractionAgent:
             method = table_info.get('method', '')
 
             try:
+                table_data = []
+
                 if method == 'tabula' or method == 'camelot':
-                    # Data is already available as DataFrame
                     df = table_info.get('data')
                     table_data = self._clean_dataframe(df)
 
                 elif method == 'docx':
-                    # Extract from DOCX table object
                     table_obj = table_info.get('table_obj')
                     table_data = self._extract_from_docx_table(table_obj)
 
                 elif method == 'mammoth':
-                    # Parse tables from HTML
                     html = table_info.get('html')
                     table_data = self._extract_from_html(html)
 
-                elif method == 'visual' or method == 'image':
-                    # Use OCR on the image
+                elif method == 'text':
+                    # Process text lines into structured data
+                    text_lines = table_info.get('text_content', [])
+                    table_data = self._extract_from_text_lines(text_lines)
+
+                elif method in ['visual', 'image', 'fullpage']:
                     img = table_info.get('raw_image')
-                    table_data = self._extract_with_ocr(img)
+                    if img is not None:
+                        table_data = self._extract_with_ocr(img)
 
                 else:
                     logger.warning(f"Unknown extraction method: {method}")
                     continue
 
-                # Validate and add to results
+                # Add to results if data was extracted
                 if table_data and len(table_data) > 0:
                     extracted_table = {
                         'table_id': i + 1,
@@ -261,148 +364,182 @@ class ExtractionAgent:
                     self.extracted_tables.append(extracted_table)
 
             except Exception as e:
-                logger.error(f"Error extracting table {i + 1}: {e}")
+                logger.error(f"Error extracting table {i + 1}: {str(e)}")
 
         return self.extracted_tables
 
     def _clean_dataframe(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         """Clean and convert DataFrame to structured data."""
-        # Drop rows and columns that are all NaN
-        df = df.dropna(how='all').dropna(axis=1, how='all')
+        try:
+            # Handle DataFrame cleaning safely
+            df = df.dropna(how='all').dropna(axis=1, how='all')
+            df = df.fillna('')
 
-        # Fill NaN values with empty strings
-        df = df.fillna('')
+            # Check for missing headers
+            if all(isinstance(col, (int, float)) or str(col).startswith('Unnamed:') for col in df.columns):
+                if not df.empty:
+                    # Use first row as headers if available
+                    first_row = df.iloc[0].tolist()
+                    if any(str(x).strip() != '' for x in first_row):
+                        headers = [str(x).strip() if str(x).strip() else f"Column_{i}" for i, x in enumerate(first_row)]
+                        df.columns = headers
+                        df = df.iloc[1:].reset_index(drop=True)
+                    else:
+                        df.columns = [f"Column_{i + 1}" for i in range(len(df.columns))]
+                else:
+                    df.columns = [f"Column_{i + 1}" for i in range(len(df.columns))]
 
-        # Convert to list of dicts
-        records = df.to_dict('records')
+            # Convert to list of dicts
+            records = []
+            for _, row in df.iterrows():
+                # Convert each cell to string to avoid serialization issues
+                record = {str(col): str(val) if val is not None else '' for col, val in row.items()}
+                records.append(record)
 
-        # Clean column headers if they're numeric or unnamed
-        if all(isinstance(col, (int, float)) or str(col).startswith('Unnamed:') for col in df.columns):
-            # If the first row looks like headers, use it
-            first_row = df.iloc[0].tolist()
-            if any(str(x).strip() != '' for x in first_row):
-                headers = [str(x).strip() if str(x).strip() else f"Column_{i}" for i, x in enumerate(first_row)]
-                records = df.iloc[1:].to_dict('records')
-
-                # Create new records with proper headers
-                cleaned_records = []
-                for record in records:
-                    cleaned_record = {}
-                    for i, header in enumerate(headers):
-                        if i < len(df.columns):
-                            col = df.columns[i]
-                            cleaned_record[header] = record[col]
-                    cleaned_records.append(cleaned_record)
-                return cleaned_records
-
-        return records
+            return records
+        except Exception as e:
+            logger.warning(f"Error cleaning DataFrame: {e}")
+            return []
 
     def _extract_from_docx_table(self, table: DocxTable) -> List[Dict[str, Any]]:
         """Extract data from a DOCX table object."""
-        data = []
+        try:
+            data = []
 
-        # Get headers from first row
-        headers = []
-        for cell in table.rows[0].cells:
-            headers.append(cell.text.strip() or f"Column_{len(headers) + 1}")
+            # Get headers from first row
+            if len(table.rows) == 0:
+                return []
 
-        # Extract data from remaining rows
-        for row in table.rows[1:]:
-            row_data = {}
-            for i, cell in enumerate(row.cells):
-                if i < len(headers):
-                    row_data[headers[i]] = cell.text.strip()
-            data.append(row_data)
+            headers = []
+            for cell in table.rows[0].cells:
+                headers.append(cell.text.strip() or f"Column_{len(headers) + 1}")
 
-        return data
+            # Extract data rows
+            for row in table.rows[1:]:
+                row_data = {}
+                for i, cell in enumerate(row.cells):
+                    if i < len(headers):
+                        row_data[headers[i]] = cell.text.strip()
+                if row_data:
+                    data.append(row_data)
+
+            return data
+        except Exception as e:
+            logger.warning(f"Error extracting from DOCX table: {e}")
+            return []
 
     def _extract_from_html(self, html: str) -> List[Dict[str, Any]]:
         """Extract table data from HTML content."""
-        # Use pandas to parse HTML tables
-        tables = pd.read_html(html)
+        try:
+            # Parse HTML tables
+            tables = pd.read_html(html)
 
-        all_data = []
-        for df in tables:
-            all_data.extend(self._clean_dataframe(df))
+            all_data = []
+            for df in tables:
+                all_data.extend(self._clean_dataframe(df))
 
-        return all_data
-
-    def _extract_with_ocr(self, img) -> List[Dict[str, Any]]:
-        """Extract table data using OCR."""
-        # Preprocess the image for better OCR results
-        if isinstance(img, np.ndarray):
-            # Convert to PIL Image
-            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        else:
-            img_pil = img
-
-        # Use Tesseract to extract text with table structure preserved
-        custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
-        ocr_text = pytesseract.image_to_string(img_pil, config=custom_config)
-
-        # Try to parse as CSV-like data
-        lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
-
-        # Attempt to detect columns based on consistent spacing
-        if not lines:
+            return all_data
+        except Exception as e:
+            logger.warning(f"Error extracting from HTML: {e}")
             return []
 
-        # Use the first line as header
-        header_line = lines[0]
+    def _extract_from_text_lines(self, lines: List[str]) -> List[Dict[str, Any]]:
+        """Extract table-like data from text lines."""
+        if not lines or len(lines) < 2:
+            return []
 
-        # Try to split by multiple spaces or tabs
-        import re
-        pattern = r'\s{2,}|\t'
-        headers = [h.strip() for h in re.split(pattern, header_line) if h.strip()]
+        try:
+            # Look for delimiter patterns
+            delimiters = ['|', '\t', '  ']
+            best_delimiter = None
+            max_columns = 0
 
-        # If no headers were found, try another approach
-        if len(headers) <= 1:
-            # Try to split by other common delimiters
-            for delimiter in ['|', ',', ';']:
-                if delimiter in header_line:
-                    headers = [h.strip() for h in header_line.split(delimiter) if h.strip()]
-                    break
-
-        # If still no valid headers, create default ones based on the line with most splits
-        if len(headers) <= 1:
-            max_splits = 0
-            split_pattern = None
-
-            for pattern in [r'\s{2,}|\t', r'\|', r',', r';']:
+            # Find the best delimiter
+            for delimiter in delimiters:
+                column_counts = []
                 for line in lines:
-                    splits = len([s for s in re.split(pattern, line) if s.strip()])
-                    if splits > max_splits:
-                        max_splits = splits
-                        split_pattern = pattern
+                    parts = [part.strip() for part in line.split(delimiter) if part.strip()]
+                    if len(parts) > 1:
+                        column_counts.append(len(parts))
 
-            if max_splits > 1:
-                headers = [f"Column_{i + 1}" for i in range(max_splits)]
-                pattern = split_pattern
-            else:
-                # Last resort - just treat each line as a single value
-                headers = ["Content"]
-                return [{"Content": line} for line in lines]
+                if column_counts:
+                    most_common_count = max(set(column_counts), key=column_counts.count)
+                    if most_common_count > max_columns:
+                        max_columns = most_common_count
+                        best_delimiter = delimiter
 
-        # Process data rows
-        data = []
-        for line in lines[1:]:
-            values = [v.strip() for v in re.split(pattern, line) if v.strip()]
+            # If a good delimiter was found
+            if best_delimiter and max_columns > 1:
+                # Parse data rows
+                data_rows = []
+                for line in lines:
+                    parts = [part.strip() for part in line.split(best_delimiter) if part.strip()]
+                    if len(parts) > 1:
+                        data_rows.append(parts)
 
-            # Skip rows that don't have enough values
-            if len(values) <= 1:
-                continue
+                if not data_rows:
+                    return []
 
-            row_data = {}
-            for i, value in enumerate(values):
-                if i < len(headers):
-                    row_data[headers[i]] = value
+                # Create structured data
+                headers = data_rows[0] if len(data_rows) > 1 else [f"Column_{i + 1}" for i in range(len(data_rows[0]))]
+                table_data = []
+
+                for row in data_rows[1:] if len(data_rows) > 1 else data_rows:
+                    row_dict = {}
+                    for i, cell in enumerate(row):
+                        if i < len(headers):
+                            row_dict[headers[i]] = cell
+                    if row_dict:
+                        table_data.append(row_dict)
+
+                return table_data
+
+            # Fallback: Return lines as simple data
+            return [{"Line_Content": line} for line in lines]
+
+        except Exception as e:
+            logger.warning(f"Error extracting from text lines: {e}")
+            return []
+
+    def _extract_with_ocr(self, img) -> List[Dict[str, Any]]:
+        """Extract table data using OCR with improved error handling."""
+        try:
+            # Preprocess image
+            if not isinstance(img, (np.ndarray, Image.Image)):
+                logger.warning("Invalid image type for OCR")
+                return []
+
+            if isinstance(img, np.ndarray):
+                # Convert BGR to RGB if needed
+                if img.shape[2] == 3:
+                    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 else:
-                    # Handle case where there are more values than headers
-                    row_data[f"Extra_{i - len(headers) + 1}"] = value
+                    img_pil = Image.fromarray(img)
 
-            data.append(row_data)
+                # Enhance contrast
+                img_np = np.array(img_pil)
+                img_np = cv2.convertScaleAbs(img_np, alpha=1.5, beta=0)
+                img_pil = Image.fromarray(img_np)
+            else:
+                img_pil = img
 
-        return data
+            # Run OCR with error handling
+            try:
+                custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+                ocr_text = pytesseract.image_to_string(img_pil, config=custom_config)
+            except Exception as e:
+                logger.warning(f"OCR error: {e}")
+                return []
+
+            # Process the extracted text
+            lines = [line.strip() for line in ocr_text.splitlines() if line.strip()]
+
+            # Convert to structured data
+            return self._extract_from_text_lines(lines)
+
+        except Exception as e:
+            logger.warning(f"Error in OCR extraction: {e}")
+            return []
 
 
 class ValidationAgent:
@@ -411,8 +548,6 @@ class ValidationAgent:
     def __init__(self, tables: List[Dict[str, Any]], groq_api_key: Optional[str] = None):
         self.tables = tables
         self.groq_api_key = groq_api_key
-        if groq_api_key:
-            groq.api_key = groq_api_key
 
     def process(self) -> List[Dict[str, Any]]:
         """Validate and correct the extracted tables."""
@@ -427,10 +562,9 @@ class ValidationAgent:
                 logger.warning(f"Table {table_id} has no data to validate")
                 continue
 
-            # First, perform basic validation
+            # Basic validation and correction
             validation_issues = self._validate_table(data)
 
-            # If issues are detected, try to correct them
             if validation_issues:
                 logger.info(f"Table {table_id} has {len(validation_issues)} issues, attempting correction")
                 corrected_data = self._correct_table(data, validation_issues)
@@ -450,221 +584,137 @@ class ValidationAgent:
         if not data:
             return [{'type': 'empty_table', 'description': 'Table has no data'}]
 
-        # Check for consistent columns across all rows
-        all_keys = set()
-        for row in data:
-            all_keys.update(row.keys())
+        try:
+            # Check for consistent columns
+            all_keys = set()
+            for row in data:
+                all_keys.update(row.keys())
 
-        for i, row in enumerate(data):
-            row_keys = set(row.keys())
-            missing_keys = all_keys - row_keys
+            for i, row in enumerate(data):
+                row_keys = set(row.keys())
+                missing_keys = all_keys - row_keys
 
-            if missing_keys:
-                issues.append({
-                    'type': 'missing_fields',
-                    'row': i,
-                    'fields': list(missing_keys),
-                    'description': f"Row {i} is missing fields: {', '.join(missing_keys)}"
-                })
-
-        # Check for completely empty cells
-        for i, row in enumerate(data):
-            for key, value in row.items():
-                if value == '' or value is None:
+                if missing_keys:
                     issues.append({
-                        'type': 'empty_cell',
+                        'type': 'missing_fields',
                         'row': i,
-                        'field': key,
-                        'description': f"Empty cell at row {i}, column '{key}'"
+                        'fields': list(missing_keys)
                     })
 
-        # Check for inconsistent data types
-        for key in all_keys:
-            types = set()
-            for row in data:
-                if key in row and row[key]:
-                    value = row[key]
-                    # Try to determine if it's a number, date, or text
-                    try:
-                        float(value)
-                        types.add('number')
-                    except ValueError:
-                        # Check for date patterns - simplified approach
-                        if '/' in value or '-' in value:
-                            if sum(c.isdigit() for c in value) >= 4:
-                                types.add('date')
-                            else:
-                                types.add('text')
-                        else:
-                            types.add('text')
-
-            if len(types) > 1:
-                issues.append({
-                    'type': 'inconsistent_types',
-                    'field': key,
-                    'types': list(types),
-                    'description': f"Column '{key}' has inconsistent data types: {', '.join(types)}"
-                })
+            # Check for empty cells
+            for i, row in enumerate(data):
+                for key, value in row.items():
+                    if value == '' or value is None:
+                        issues.append({
+                            'type': 'empty_cell',
+                            'row': i,
+                            'field': key
+                        })
+        except Exception as e:
+            logger.warning(f"Error validating table: {e}")
 
         return issues
 
     def _correct_table(self, data: List[Dict[str, Any]], issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Attempt to correct table data issues."""
-        corrected_data = data.copy()
-
-        # Process issues by type
-        for issue in issues:
-            issue_type = issue.get('type')
-
-            if issue_type == 'missing_fields':
-                row_idx = issue.get('row')
-                fields = issue.get('fields', [])
-
-                for field in fields:
-                    # Add missing field with empty value for now
-                    corrected_data[row_idx][field] = ''
-
-            elif issue_type == 'empty_cell':
-                row_idx = issue.get('row')
-                field = issue.get('field')
-
-                # Try to infer a value
-                inferred_value = self._infer_value(corrected_data, row_idx, field)
-
-                if inferred_value:
-                    corrected_data[row_idx][field] = inferred_value
-                elif self.groq_api_key:
-                    # If we can't infer, and LLM is available, use it
-                    llm_value = self._correct_with_llm(corrected_data, row_idx, field)
-                    if llm_value:
-                        corrected_data[row_idx][field] = llm_value
-
-        # If OpenAI API is available, use it for final validation
-        if self.groq_api_key:
-            corrected_data = self._llm_final_validation(corrected_data)
-
-        return corrected_data
-
-    def _infer_value(self, data: List[Dict[str, Any]], row_idx: int, field: str) -> str:
-        """Try to infer a missing value based on patterns in the data."""
-        # Get values for this field from other rows
-        field_values = [row.get(field, '') for i, row in enumerate(data) if i != row_idx and field in row]
-
-        if not field_values:
-            return ''
-
-        # If all values are the same, use that value
-        if len(set(field_values)) == 1 and field_values[0]:
-            return field_values[0]
-
-        # Try to infer numeric values
-        numeric_values = []
-        for value in field_values:
-            try:
-                numeric_values.append(float(value))
-            except (ValueError, TypeError):
-                pass
-
-        if numeric_values and len(numeric_values) == len(field_values):
-            # If all values are numeric, use the average
-            return str(sum(numeric_values) / len(numeric_values))
-
-        # If most values are the same, use the most common
-        from collections import Counter
-        value_counts = Counter(field_values)
-        most_common = value_counts.most_common(1)
-        if most_common and most_common[0][1] > len(field_values) / 2:
-            return most_common[0][0]
-
-        return ''
-
-    def _correct_with_llm(self, data: List[Dict[str, Any]], row_idx: int, field: str) -> str:
-        """Use a language model to suggest a correction for an empty or problematic value."""
-        if not self.groq_api_key:
-            return ''
-
         try:
-            # Prepare context for the LLM
-            table_context = json.dumps(data[:5] if len(data) > 5 else data, indent=2)
+            corrected_data = data.copy()
 
-            prompt = f"""
-            I have a table with missing or problematic data. Below is part of the table:
+            # Fix missing fields
+            for issue in issues:
+                if issue.get('type') == 'missing_fields':
+                    row_idx = issue.get('row', 0)
+                    fields = issue.get('fields', [])
 
-            {table_context}
+                    if 0 <= row_idx < len(corrected_data):
+                        for field in fields:
+                            corrected_data[row_idx][field] = ''
 
-            Row {row_idx} is missing a value for the column '{field}'. Based on the other data in the table, 
-            what is the most likely value for this field? Please provide only the value with no explanation.
-            """
+                elif issue.get('type') == 'empty_cell':
+                    row_idx = issue.get('row', 0)
+                    field = issue.get('field', '')
 
+                    if 0 <= row_idx < len(corrected_data) and field in corrected_data[row_idx]:
+                        # Try to infer a value from other rows
+                        values = [row.get(field, '') for i, row in enumerate(data)
+                                  if i != row_idx and field in row and row[field]]
 
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "system",
-                     "content": "You are a data correction assistant that fills in missing values in tables. Your answers should be concise and contain only the corrected value."},
-                          {"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                max_tokens=50,
-                temperature = 0.1
-            )
+                        if values:
+                            # Use most common value
+                            from collections import Counter
+                            most_common = Counter(values).most_common(1)
+                            if most_common:
+                                corrected_data[row_idx][field] = most_common[0][0]
 
-            # Extract and clean the suggested correction
-            suggested_value = chat_completion.choices[0].message.content.strip()
-            return suggested_value
+            # Use LLM if available and table has significant data
+            if self.groq_api_key and client and len(data) > 3:
+                try:
+                    # Sample data for LLM correction
+                    sample = data[:3]
+                    corrected_sample = self._llm_correction(sample)
+
+                    # Apply corrections to sample
+                    if corrected_sample and len(corrected_sample) == len(sample):
+                        for i in range(len(sample)):
+                            corrected_data[i] = corrected_sample[i]
+                except Exception as e:
+                    logger.warning(f"LLM correction error: {e}")
+
+            return corrected_data
 
         except Exception as e:
-            logger.warning(f"Error using LLM for correction: {e}")
-            return ''
-
-    def _llm_final_validation(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Use LLM for a final validation pass on the entire table."""
-        if not self.groq_api_key or not data:
+            logger.warning(f"Error correcting table: {e}")
             return data
 
+    def _llm_correction(self, sample_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Use LLM to correct a sample of table data."""
+        if not self.groq_api_key or not client or not sample_data:
+            return None
+
         try:
-            # Sample the table if it's large
-            sample_size = min(len(data), 5)
-            sample_data = data[:sample_size]
+            # Create a safe JSON string
+            safe_json = json.dumps(sample_data, ensure_ascii=True)
 
             prompt = f"""
-            I have extracted a table from a document. Below is a sample of the data:
-
-            {json.dumps(sample_data, indent=2)}
-
-            Please review this table for any inconsistencies, missing values, or obvious errors. 
-            Return the corrected version of the ENTIRE input sample in valid JSON format with no extra text.
+            Review and correct this table data sample:
+            ```
+            {safe_json}
+            ```
+            Fix any inconsistencies or errors. Return only the corrected JSON with no extra text.
             """
 
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "system",
-                           "content": "You are a data validation assistant that fixes errors in extracted table data. Your answers should contain only valid JSON with the corrected data."},
-                          {"role": "user", "content": prompt}],
+            # Get LLM response
+            response = client.chat.completions.create(
+                messages=[
+                    {"role": "system",
+                     "content": "You are a data validation assistant that fixes errors in table data. Return only valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
                 model="llama-3.3-70b-versatile",
-                max_tokens=1500,
+                max_tokens=1000,
                 temperature=0.1
             )
-            # Extract the corrected JSON
-            corrected_json_str = chat_completion.choices[0].message.content.strip()
 
-            # Remove any markdown code block syntax if present
-            if corrected_json_str.startswith("```") and corrected_json_str.endswith("```"):
-                corrected_json_str = corrected_json_str[3:-3].strip()
-            if corrected_json_str.startswith("```json") and corrected_json_str.endswith("```"):
-                corrected_json_str = corrected_json_str[7:-3].strip()
+            # Extract and parse the JSON response
+            result = response.choices[0].message.content.strip()
+            time.sleep(10)
+            # Remove code block syntax if present
+            if result.startswith("```") and result.endswith("```"):
+                result = result[3:-3].strip()
+            if result.startswith("```json") and result.endswith("```"):
+                result = result[7:-3].strip()
 
             try:
-                corrected_sample = json.loads(corrected_json_str)
-
-                # Apply corrections from the sample to the full dataset
-                if len(corrected_sample) == sample_size:
-                    for i in range(sample_size):
-                        data[i] = corrected_sample[i]
-
+                corrected_data = json.loads(result)
+                if isinstance(corrected_data, list):
+                    return corrected_data
             except json.JSONDecodeError:
-                logger.warning("Could not parse LLM correction as JSON")
+                logger.warning("Failed to parse LLM response as JSON")
 
         except Exception as e:
-            logger.warning(f"Error using LLM for final validation: {e}")
+            logger.warning(f"LLM processing error: {e}")
 
-        return data
+        return None
 
 
 class TableExtractionPipeline:
@@ -679,35 +729,40 @@ class TableExtractionPipeline:
         """Execute the full table extraction pipeline."""
         logger.info(f"Starting table extraction for {self.file_path}")
 
-        # Step 1: Identify tables in the document
-        document_agent = DocumentAgent(self.file_path)
-        tables_info = document_agent.process()
-        logger.info(f"Found {len(tables_info)} potential tables")
+        try:
+            # Step 1: Identify tables
+            document_agent = DocumentAgent(self.file_path)
+            tables_info = document_agent.process()
+            logger.info(f"Found {len(tables_info)} potential tables")
 
-        if not tables_info:
-            logger.warning("No tables found in the document")
-            return {"tables": [], "message": "No tables found"}
+            if not tables_info:
+                logger.warning("No tables found in the document")
+                result = {"tables": [], "message": "No tables found"}
+            else:
+                # Step 2: Extract data
+                extraction_agent = ExtractionAgent(tables_info, self.file_path)
+                extracted_tables = extraction_agent.process()
+                logger.info(f"Extracted data from {len(extracted_tables)} tables")
 
-        # Step 2: Extract data from identified tables
-        extraction_agent = ExtractionAgent(tables_info, self.file_path)
-        extracted_tables = extraction_agent.process()
-        logger.info(f"Extracted data from {len(extracted_tables)} tables")
+                # Step 3: Validate and correct
+                validation_agent = ValidationAgent(extracted_tables, self.groq_api_key)
+                validated_tables = validation_agent.process()
 
-        # Step 3: Validate and correct the extracted data
-        validation_agent = ValidationAgent(extracted_tables, self.groq_api_key)
-        validated_tables = validation_agent.process()
+                result = {
+                    "file": os.path.basename(self.file_path),
+                    "tables": validated_tables,
+                    "table_count": len(validated_tables),
+                    "extraction_timestamp": str(pd.Timestamp.now())
+                }
 
-        result = {
-            "file": os.path.basename(self.file_path),
-            "tables": validated_tables,
-            "table_count": len(validated_tables),
-            "extraction_timestamp": pd.Timestamp.now().isoformat()
-        }
-
-        # Save to JSON file
-        with open(self.output_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-
+            # Save results
+            try:
+                with open(self.output_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+            except:
+                print("Not possible to get the tables inside")
+        except:
+            print("Not possible to get the tables inside")
         logger.info(f"Saved extraction results to {self.output_path}")
 
         return result
@@ -716,7 +771,7 @@ class TableExtractionPipeline:
 def main():
 
 
-    file_path = r"C:\Users\SanskarZanwar\PycharmProjects\TableDataExctraction\input\ast_sci_data_tables_sample.pdf"
+    file_path = r"C:\Users\SanskarZanwar\PycharmProjects\TableDataExctraction\input\SYB67_1_202411_Population, Surface Area and Density.pdf"
     output_path = r"C:\Users\SanskarZanwar\PycharmProjects\TableDataExctraction\output"
     if not os.path.isfile(file_path):
         print(f"Error: Input file path not found.")
@@ -731,7 +786,7 @@ def main():
     result = pipeline.run()
 
     print(f"\nExtraction complete!")
-    print(f"Found {result['table_count']} tables in {os.path.basename(file_path)}")
+    #print(f"Found {result['table_count']} tables in {os.path.basename(file_path)}")
     print(f"Results saved to {pipeline.output_path}")
 
 
