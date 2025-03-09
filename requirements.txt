@@ -1,0 +1,19 @@
+# Core dependencies
+python-dotenv~=1.0.1
+
+groq~=0.18.0
+
+numpy~=2.2.3
+pandas~=2.2.3
+pathlib~=1.0.1
+nltk~=3.9.1
+PyYAML~=6.0.2
+fitz~=0.0.1.dev2
+pymupdf
+opencv-python~=4.11.0.86
+pytesseract~=0.3.13
+python-docx
+Camelot~=12.6.29
+mammoth~=1.9.0
+pillow~=11.1.0
+tabula-py

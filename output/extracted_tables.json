@@ -1,0 +1,151 @@
+{
+  "file": "ast_sci_data_tables_sample.pdf",
+  "tables": [
+    {
+      "table_id": 1,
+      "method": "tabula",
+      "data": [
+        {
+          "Number of Coils": 5,
+          "Number of Paperclips": "3, 5, 4"
+        },
+        {
+          "Number of Coils": 10,
+          "Number of Paperclips": "7, 8, 6"
+        },
+        {
+          "Number of Coils": 15,
+          "Number of Paperclips": "11, 10, 12"
+        },
+        {
+          "Number of Coils": 20,
+          "Number of Paperclips": "15, 13, 14"
+        }
+      ],
+      "page": 1,
+      "validation": "valid"
+    },
+    {
+      "table_id": 3,
+      "method": "tabula",
+      "data": [
+        {
+          "Speed (mph)": 407.447,
+          "Driver": "Craig Breedlove",
+          "Car": "Spirit of America",
+          "Engine": "GE J47",
+          "Date": "8/5/63"
+        },
+        {
+          "Speed (mph)": 413.199,
+          "Driver": "Tom Green",
+          "Car": "Wingfoot Express",
+          "Engine": "WE J46",
+          "Date": "10/2/64"
+        },
+        {
+          "Speed (mph)": 434.22,
+          "Driver": "Art Arfons",
+          "Car": "Green Monster",
+          "Engine": "GE J79",
+          "Date": "10/5/64"
+        },
+        {
+          "Speed (mph)": 468.719,
+          "Driver": "Craig Breedlove",
+          "Car": "Spirit of America",
+          "Engine": "GE J79",
+          "Date": "10/13/64"
+        },
+        {
+          "Speed (mph)": 526.277,
+          "Driver": "Craig Breedlove",
+          "Car": "Spirit of America",
+          "Engine": "GE J79",
+          "Date": "10/15/65"
+        },
+        {
+          "Speed (mph)": 536.712,
+          "Driver": "Art Arfons",
+          "Car": "Green Monster",
+          "Engine": "GE J79",
+          "Date": "10/27/65"
+        },
+        {
+          "Speed (mph)": 555.127,
+          "Driver": "Craig Breedlove",
+          "Car": "Spirit of America, Sonic 1",
+          "Engine": "GE J79",
+          "Date": "11/2/65"
+        },
+        {
+          "Speed (mph)": 576.553,
+          "Driver": "Art Arfons",
+          "Car": "Green Monster",
+          "Engine": "GE J79",
+          "Date": "11/7/65"
+        },
+        {
+          "Speed (mph)": 600.601,
+          "Driver": "Craig Breedlove",
+          "Car": "Spirit of America, Sonic 1",
+          "Engine": "GE J79",
+          "Date": "11/15/65"
+        },
+        {
+          "Speed (mph)": 622.407,
+          "Driver": "Gary Gabelich",
+          "Car": "Blue Flame",
+          "Engine": "Rocket",
+          "Date": "10/23/70"
+        },
+        {
+          "Speed (mph)": 633.468,
+          "Driver": "Richard Noble",
+          "Car": "Thrust 2",
+          "Engine": "RR RG 146",
+          "Date": "10/4/83"
+        },
+        {
+          "Speed (mph)": 763.035,
+          "Driver": "Andy Green",
+          "Car": "Thrust SSC",
+          "Engine": "RR Spey",
+          "Date": "10/15/97"
+        }
+      ],
+      "page": 2,
+      "validation": "valid"
+    },
+    {
+      "table_id": 6,
+      "method": "tabula",
+      "data": [
+        {
+          "Time (drops of water)": 1,
+          "Distance (cm)": "10,11,9"
+        },
+        {
+          "Time (drops of water)": 2,
+          "Distance (cm)": "29, 31, 30"
+        },
+        {
+          "Time (drops of water)": 3,
+          "Distance (cm)": "59, 58, 61"
+        },
+        {
+          "Time (drops of water)": 4,
+          "Distance (cm)": "102, 100, 98"
+        },
+        {
+          "Time (drops of water)": 5,
+          "Distance (cm)": "122, 125, 127"
+        }
+      ],
+      "page": 3,
+      "validation": "valid"
+    }
+  ],
+  "table_count": 3,
+  "extraction_timestamp": "2025-03-09T17:55:55.196744"
+}
